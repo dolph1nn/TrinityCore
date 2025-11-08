@@ -110,10 +110,7 @@ struct boss_patchwerk : public BossAI
                 case EVENT_HATEFUL:
                 {
                     // Hateful Strike targets the highest non-MT threat in melee range on 10man
-                    // and the higher HP target out of the two highest non-MT threats in melee range on 25man
-                    ThreatReference* secondThreat = nullptr;
-                    ThreatReference* thirdThreat = nullptr;
-
+                    // and the higher HP target out of the top non-MT threats in melee range on 25man
                     ThreatManager& mgr = me->GetThreatManager();
                     Unit* currentVictim = mgr.GetCurrentVictim();
                     auto list = mgr.GetModifiableThreatList();
@@ -124,30 +121,123 @@ struct boss_patchwerk : public BossAI
                         return;
                     }
 
-                    if ((*it)->GetVictim() != currentVictim)
-                        secondThreat = *it;
-                    if ((!secondThreat || Is25ManRaid()) && (++it != end && (*it)->IsAvailable()))
+                    // Build list of valid melee range targets (excluding MT)
+                    // For 10-man: Find the highest non-MT threat that IS in melee range
+                    // For 25-man: Find the top 2 non-MT threats that ARE in melee range
+                    std::vector<ThreatReference*> meleeThreats;
+                    uint32 maxThreatsToCheck = 10; // Check up to 10 non-MT threats to find valid melee targets
+                    uint32 nonMTThreatsChecked = 0;
+                    uint32 meleeTargetsNeeded = Is25ManRaid() ? 2 : 1; // Need 2 melee targets for 25man, 1 for 10man
+
+                    for (auto threatIt = list.begin(); threatIt != end && nonMTThreatsChecked < maxThreatsToCheck && meleeThreats.size() < meleeTargetsNeeded; ++threatIt)
                     {
-                        if ((*it)->GetVictim() != currentVictim)
-                            (secondThreat ? thirdThreat : secondThreat) = *it;
-                        if (!thirdThreat && Is25ManRaid() && (++it != end && (*it)->IsAvailable()))
-                            thirdThreat = *it;
+                        ThreatReference* threatRef = *threatIt;
+                        if (!threatRef->IsAvailable())
+                            continue;
+
+                        Unit* threatTarget = threatRef->GetVictim();
+                        if (!threatTarget || threatTarget == currentVictim)
+                            continue;
+
+                        // Count this as a checked non-MT threat
+                        nonMTThreatsChecked++;
+
+                        // Only consider targets in melee range
+                        if (me->IsWithinMeleeRange(threatTarget))
+                        {
+                            meleeThreats.push_back(threatRef);
+                            // For 10-man: Stop once we find the first (highest threat) melee target
+                            // For 25-man: Continue until we find 2 melee targets
+                        }
                     }
 
-                    Unit* pHatefulTarget = nullptr;
-                    if (!secondThreat)
-                        pHatefulTarget = currentVictim;
-                    else if (!thirdThreat)
-                        pHatefulTarget = secondThreat->GetVictim();
-                    else
-                        pHatefulTarget = (secondThreat->GetVictim()->GetHealth() < thirdThreat->GetVictim()->GetHealth()) ? thirdThreat->GetVictim() : secondThreat->GetVictim();
+                    // Also check if MT is in melee range
+                    bool mtInMelee = me->IsWithinMeleeRange(currentVictim);
 
-                    // add threat to highest threat targets
+                    Unit* pHatefulTarget = nullptr;
+
+                    if (Is25ManRaid())
+                    {
+                        // 25-man logic: Take top threats, filter to melee, then pick highest HP
+                        // If > 1 target in melee (including MT), ignore MT and pick highest HP from non-MT
+                        // If exactly 1 target in melee, that's the MT, hit MT
+                        uint32 totalMeleeTargets = meleeThreats.size() + (mtInMelee ? 1 : 0);
+                        
+                        if (totalMeleeTargets > 1)
+                        {
+                            // Multiple targets in melee, ignore MT and pick highest HP from non-MT targets
+                            if (meleeThreats.empty())
+                            {
+                                // This shouldn't happen if totalMeleeTargets > 1, but fallback to MT
+                                pHatefulTarget = mtInMelee ? currentVictim : nullptr;
+                            }
+                            else
+                            {
+                                // Pick highest HP from non-MT melee targets
+                                Unit* highestHPTarget = nullptr;
+                                uint32 highestHP = 0;
+                                for (ThreatReference* threatRef : meleeThreats)
+                                {
+                                    Unit* target = threatRef->GetVictim();
+                                    uint32 targetHP = target->GetHealth();
+                                    if (targetHP > highestHP)
+                                    {
+                                        highestHP = targetHP;
+                                        highestHPTarget = target;
+                                    }
+                                }
+                                pHatefulTarget = highestHPTarget;
+                            }
+                        }
+                        else if (totalMeleeTargets == 1)
+                        {
+                            // Exactly one target in melee, that's the MT
+                            pHatefulTarget = mtInMelee ? currentVictim : nullptr;
+                        }
+                        else
+                        {
+                            // No targets in melee range
+                            pHatefulTarget = nullptr;
+                        }
+                    }
+                    else
+                    {
+                        // 10-man logic: Highest non-MT threat in melee, or MT if no one else in melee
+                        if (meleeThreats.empty())
+                        {
+                            // No non-MT targets in melee, hit MT if in melee
+                            pHatefulTarget = mtInMelee ? currentVictim : nullptr;
+                        }
+                        else
+                        {
+                            // Hit the highest threat non-MT target in melee (first in list is highest threat)
+                            pHatefulTarget = meleeThreats[0]->GetVictim();
+                        }
+                    }
+
+                    // Fallback: if we somehow have no valid target but MT is in melee, hit MT
+                    if (!pHatefulTarget && mtInMelee)
+                        pHatefulTarget = currentVictim;
+
+                    // If still no target, skip this cast
+                    if (!pHatefulTarget)
+                    {
+                        events.Repeat(1200ms);
+                        break;
+                    }
+
+                    // Add threat to highest threat targets (up to top 3)
                     AddThreat(currentVictim, HATEFUL_THREAT_AMT);
-                    if (secondThreat)
-                        secondThreat->AddThreat(HATEFUL_THREAT_AMT);
-                    if (thirdThreat)
-                        thirdThreat->AddThreat(HATEFUL_THREAT_AMT);
+                    uint32 threatCount = 0;
+                    for (auto threatIt = list.begin(); threatIt != end && threatCount < 2; ++threatIt)
+                    {
+                        ThreatReference* threatRef = *threatIt;
+                        if (threatRef->IsAvailable() && threatRef->GetVictim() != currentVictim)
+                        {
+                            threatRef->AddThreat(HATEFUL_THREAT_AMT);
+                            threatCount++;
+                        }
+                    }
 
                     DoCast(pHatefulTarget, SPELL_HATEFUL_STRIKE, true);
 
